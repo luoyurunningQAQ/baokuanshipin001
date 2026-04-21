@@ -396,6 +396,11 @@ class AIAnalyzer:
         )
 
         from datetime import datetime
+        _newline = "\n"
+        scene_table_rows = "".join(
+            f"| {t}s | ⚠️ 需 AI 分析 | — |{_newline}"
+            for t in features.get("scene_change_timestamps", [])[:10]
+        )
         return f"""# AutoViral AI 爆款分析报告（本地模式）
 
 > ⚠️ **本地模式限制说明**
@@ -452,7 +457,7 @@ class AIAnalyzer:
 
 | 切换时间点 | 台词/字幕 | BGM 状态 |
 |-----------|---------|---------|
-{"".join([f"| {t}s | ⚠️ 需 AI 分析 | — |\n" for t in features.get("scene_change_timestamps", [])[:10]])}
+{scene_table_rows}
 
 ---
 
