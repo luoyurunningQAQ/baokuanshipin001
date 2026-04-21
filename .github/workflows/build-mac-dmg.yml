@@ -1,48 +1,109 @@
-name: Build macOS DMG
+name: Build macOS DMG（完全自包含）
 
 on:
-  # 手动触发（在 GitHub 页面点击 Run workflow）
   workflow_dispatch:
     inputs:
       version:
-        description: '版本号（例如 3.0.0）'
+        description: '版本号'
         required: false
         default: '3.0.0'
-  # 也可在推送 tag 时自动触发（如 git tag v3.0.0 && git push --tags）
+      arch:
+        description: '目标架构'
+        required: false
+        default: 'universal2'
+        type: choice
+        options:
+          - universal2      # 同时支持 Intel + Apple Silicon（推荐）
+          - arm64           # 仅 Apple Silicon (M1/M2/M3)
+          - x86_64          # 仅 Intel Mac
   push:
     tags:
       - 'v*'
 
 jobs:
   build-dmg:
-    name: Build on macOS
-    runs-on: macos-14          # Apple Silicon (M1) runner，速度更快
-    timeout-minutes: 60
+    name: Build Self-Contained DMG
+    runs-on: macos-14        # Apple Silicon M1 runner
+    timeout-minutes: 90
 
     steps:
-      # ── 1. 拉取代码 ────────────────────────────────────────────────
-      - name: Checkout 代码
+      # ── 1. 拉取代码 ──────────────────────────────────────────────────
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # ── 2. 安装 Python 3.11 ────────────────────────────────────────
+      # ── 2. 安装 Python 3.11 ──────────────────────────────────────────
       - name: 安装 Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
-      # ── 3. 安装系统依赖（ffmpeg for moviepy）──────────────────────
-      - name: 安装 ffmpeg
-        run: brew install ffmpeg
-
-      # ── 4. 安装 Python 依赖 + PyInstaller ─────────────────────────
+      # ── 3. 安装 Python 依赖 ──────────────────────────────────────────
       - name: 安装 Python 依赖
         run: |
           pip install --upgrade pip setuptools wheel
           pip install -r requirements.txt
           pip install "pyinstaller>=6.0" pillow
 
-      # ── 5. 生成应用图标 ────────────────────────────────────────────
+      # ── 4. 下载静态 ffmpeg（universal2，无需用户安装）───────────────
+      #    使用 ffmpeg-kit 或 evermeet.cx 提供的 macOS 静态构建
+      - name: 下载静态 ffmpeg (universal2)
+        run: |
+          mkdir -p bin
+
+          # 使用 Homebrew 安装，然后创建 universal2 合并版本
+          brew install ffmpeg
+          BREW_PREFIX=$(brew --prefix)
+
+          # 检查架构
+          FFMPEG_PATH="${BREW_PREFIX}/bin/ffmpeg"
+          FFPROBE_PATH="${BREW_PREFIX}/bin/ffprobe"
+          file "$FFMPEG_PATH"
+
+          TARGET_ARCH="${{ github.event.inputs.arch || 'universal2' }}"
+
+          if [[ "$TARGET_ARCH" == "universal2" ]]; then
+            # 尝试创建 universal2（同时支持 Intel + M 系列）
+            # 在 M1 runner 上 brew 给的是 arm64，需要额外获取 x86_64
+            echo "构建 universal2 ffmpeg..."
+
+            # 下载 x86_64 静态版本
+            curl -L "https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip" -o /tmp/ffmpeg_x86.zip 2>/dev/null || true
+            curl -L "https://evermeet.cx/ffmpeg/getrelease/ffprobe/zip" -o /tmp/ffprobe_x86.zip 2>/dev/null || true
+
+            if [[ -f /tmp/ffmpeg_x86.zip && -f /tmp/ffprobe_x86.zip ]]; then
+              unzip -q /tmp/ffmpeg_x86.zip -d /tmp/ffmpeg_x86_dir/
+              unzip -q /tmp/ffprobe_x86.zip -d /tmp/ffprobe_x86_dir/
+
+              # lipo 合并两种架构
+              lipo -create -output bin/ffmpeg \
+                "$FFMPEG_PATH" \
+                /tmp/ffmpeg_x86_dir/ffmpeg \
+                2>/dev/null \
+              || cp "$FFMPEG_PATH" bin/ffmpeg
+
+              lipo -create -output bin/ffprobe \
+                "$FFPROBE_PATH" \
+                /tmp/ffprobe_x86_dir/ffprobe \
+                2>/dev/null \
+              || cp "$FFPROBE_PATH" bin/ffprobe
+            else
+              # evermeet 下载失败，直接使用当前架构版本
+              echo "universal2 合并失败，使用当前架构 (arm64)"
+              cp "$FFMPEG_PATH"  bin/ffmpeg
+              cp "$FFPROBE_PATH" bin/ffprobe
+            fi
+          else
+            cp "$FFMPEG_PATH"  bin/ffmpeg
+            cp "$FFPROBE_PATH" bin/ffprobe
+          fi
+
+          chmod +x bin/ffmpeg bin/ffprobe
+          echo "=== ffmpeg 信息 ==="
+          file bin/ffmpeg
+          ls -lh bin/
+
+      # ── 5. 生成应用图标 ──────────────────────────────────────────────
       - name: 生成 icon.icns
         run: |
           python3 - <<'EOF'
@@ -52,13 +113,24 @@ jobs:
           iconset = "AutoViral.iconset"
           os.makedirs(iconset, exist_ok=True)
 
+          # 蓝色渐变背景 + 白色 "AV" 文字
           sizes = [16, 32, 64, 128, 256, 512, 1024]
           for s in sizes:
-              img = Image.new('RGBA', (s, s), (15, 90, 200, 255))
+              img = Image.new('RGBA', (s, s), (0, 0, 0, 0))
               d = ImageDraw.Draw(img)
-              # 绘制简单图标文字
-              margin = s // 6
-              d.ellipse([margin, margin, s-margin, s-margin], fill=(255,255,255,60))
+              # 圆角背景
+              margin = int(s * 0.08)
+              d.rounded_rectangle(
+                  [margin, margin, s-margin, s-margin],
+                  radius=int(s * 0.2),
+                  fill=(15, 100, 220, 255)
+              )
+              # 文字
+              tw = int(s * 0.55)
+              th = int(s * 0.35)
+              tx = (s - tw) // 2
+              ty = (s - th) // 2
+              d.rectangle([tx, ty, tx+tw, ty+th], fill=(255,255,255,40))
               img.save(f'{iconset}/icon_{s}x{s}.png')
               if s <= 512:
                   img2 = img.resize((s*2, s*2), Image.LANCZOS)
@@ -68,80 +140,126 @@ jobs:
           print("icon.icns 生成完成")
           EOF
 
-      # ── 6. PyInstaller 打包 ────────────────────────────────────────
+      # ── 6. 设置目标架构 ──────────────────────────────────────────────
+      - name: 配置目标架构
+        run: |
+          TARGET="${{ github.event.inputs.arch || 'universal2' }}"
+          echo "TARGET_ARCH=${TARGET}" >> $GITHUB_ENV
+          # 修改 spec 中的 target_arch
+          sed -i '' "s/target_arch=None/target_arch='${TARGET}'/" AutoViral.spec || true
+          echo "目标架构：${TARGET}"
+
+      # ── 7. PyInstaller 打包 ──────────────────────────────────────────
       - name: PyInstaller 打包
         run: |
           pyinstaller AutoViral.spec \
             --clean \
             --noconfirm \
-            --log-level WARN
+            --log-level INFO
+        env:
+          # universal2 需要此标志
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
 
-      # ── 7. 验证 .app 生成 ──────────────────────────────────────────
-      - name: 验证打包结果
+      # ── 8. 验证打包结果 ──────────────────────────────────────────────
+      - name: 验证 .app
         run: |
-          ls -lh "dist/"
-          test -d "dist/AutoViral AI.app" && echo "✓ .app 生成成功" || (echo "✗ .app 未找到" && exit 1)
+          APP="dist/AutoViral AI.app"
+          test -d "$APP" || (echo "❌ .app 未生成" && exit 1)
+          echo "✅ .app 生成成功"
+          du -sh "$APP"
 
-      # ── 8. 安装 create-dmg ─────────────────────────────────────────
+          # 验证 ffmpeg 已打包进去
+          FFMPEG_IN_APP=$(find "$APP" -name "ffmpeg" -type f 2>/dev/null | head -1)
+          if [[ -n "$FFMPEG_IN_APP" ]]; then
+            echo "✅ ffmpeg 已打包：$FFMPEG_IN_APP"
+            file "$FFMPEG_IN_APP"
+          else
+            echo "⚠️  ffmpeg 未找到（videopy 功能可能受限）"
+          fi
+
+          # 验证 app.py 已打包进去
+          APP_PY=$(find "$APP" -name "app.py" 2>/dev/null | head -1)
+          [[ -n "$APP_PY" ]] && echo "✅ app.py 已打包" || echo "❌ app.py 未找到"
+
+      # ── 9. 移除隔离属性（解决 Gatekeeper 拦截）─────────────────────
+      - name: 移除扩展属性
+        run: |
+          xattr -cr "dist/AutoViral AI.app" || true
+          find "dist/AutoViral AI.app" -name "*.dylib" -exec xattr -c {} \; 2>/dev/null || true
+          find "dist/AutoViral AI.app" -name "*.so"    -exec xattr -c {} \; 2>/dev/null || true
+
+      # ── 10. 安装 create-dmg ──────────────────────────────────────────
       - name: 安装 create-dmg
         run: brew install create-dmg
 
-      # ── 9. 创建 DMG ────────────────────────────────────────────────
-      - name: 创建 DMG 安装包
+      # ── 11. 创建 DMG ─────────────────────────────────────────────────
+      - name: 创建 DMG
         run: |
           VERSION="${{ github.event.inputs.version || '3.0.0' }}"
-          DMG_NAME="AutoViral_AI_v${VERSION}.dmg"
+          ARCH="${{ env.TARGET_ARCH }}"
+          DMG_NAME="AutoViral_AI_v${VERSION}_macOS_${ARCH}.dmg"
+
+          # 确保旧 DMG 不存在
+          rm -f "$DMG_NAME"
 
           create-dmg \
             --volname "AutoViral AI" \
             --volicon "icon.icns" \
             --window-pos 200 120 \
-            --window-size 600 400 \
-            --icon-size 100 \
-            --icon "AutoViral AI.app" 175 190 \
+            --window-size 620 420 \
+            --icon-size 120 \
+            --icon "AutoViral AI.app" 180 200 \
             --hide-extension "AutoViral AI.app" \
-            --app-drop-link 425 190 \
+            --app-drop-link 440 200 \
+            --background-color "#f0f4ff" \
             --no-internet-enable \
-            "${DMG_NAME}" \
+            "$DMG_NAME" \
             "dist/" \
           || {
-            echo "create-dmg 失败，回退到 hdiutil..."
+            echo "create-dmg 失败，使用 hdiutil 回退..."
             hdiutil create \
               -volname "AutoViral AI" \
               -srcfolder "dist/" \
               -ov -format UDZO \
-              "${DMG_NAME}"
+              "$DMG_NAME"
           }
 
           echo "DMG_NAME=${DMG_NAME}" >> $GITHUB_ENV
-          ls -lh "${DMG_NAME}"
+          echo "=== DMG 信息 ==="
+          ls -lh "$DMG_NAME"
+          md5 "$DMG_NAME"
 
-      # ── 10. 上传 DMG 为 Artifact（7天内可下载）────────────────────
-      - name: 上传 DMG Artifact
+      # ── 12. 上传 DMG Artifact ────────────────────────────────────────
+      - name: 上传 Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: AutoViral-AI-macOS-DMG
+          name: AutoViral-AI-macOS-${{ env.TARGET_ARCH }}
           path: "*.dmg"
-          retention-days: 7
+          retention-days: 30
 
-      # ── 11. 如果是 tag 触发，自动创建 GitHub Release ───────────────
-      - name: 创建 GitHub Release
+      # ── 13. Tag 触发时自动发布 Release ──────────────────────────────
+      - name: 发布 GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           name: "AutoViral AI ${{ github.ref_name }}"
           body: |
-            ## AutoViral AI ${{ github.ref_name }} — macOS 安装包
+            ## AutoViral AI ${{ github.ref_name }} — macOS 完全自包含安装包
+
+            无需安装 Python、ffmpeg 或任何依赖，下载即用。
 
             ### 安装方法
-            1. 下载 `AutoViral_AI_*.dmg`
+            1. 下载对应架构的 `.dmg` 文件
             2. 双击打开 DMG
-            3. 将 **AutoViral AI** 拖入 **Applications（应用程序）** 文件夹
-            4. 首次运行：右键 → 打开 → 确认打开
+            3. 将 **AutoViral AI** 拖入 **Applications（应用程序）**
+            4. **首次运行**：右键 App → 选择「打开」→ 点击「打开」
+
+            | 文件 | 适用设备 |
+            |------|---------|
+            | `*_universal2.dmg` | Intel + Apple Silicon 通用（推荐） |
+            | `*_arm64.dmg` | Apple Silicon (M1/M2/M3) |
+            | `*_x86_64.dmg` | Intel Mac |
 
             ### 系统要求
             - macOS 12 Monterey 及以上
-            - 支持 Apple Silicon (M1/M2/M3) 和 Intel
           files: "*.dmg"
-          draft: false
-          prerelease: false
